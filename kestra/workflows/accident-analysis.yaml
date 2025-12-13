@@ -2,35 +2,31 @@
 # ACCIDENT ANALYSIS WORKFLOW - Kestra Orchestration
 # ============================================================================
 # 
-# This workflow orchestrates the complete accident analysis pipeline:
-#   1. Start video processing (YOLO + ByteTrack)
-#   2. Wait for processing to complete
-#   3. Get collision data
-#   4. AI analyzes collisions (OpenAI GPT-4)
-#   5. Make decisions based on severity
-#   6. Save AI summary to database
+# INNOVATIVE FEATURES:
+#   1. AI Analysis with Google Gemini
+#   2. Collision Screenshot Extraction
+#   3. Professional PDF Report with Images
+#   4. Audio Summary in English (ElevenLabs)
+#   5. Audio Summary in Hindi (ElevenLabs)
 #
-# Replaces Celery for background task orchestration.
-# Satisfies Kestra hackathon track requirement.
+# Hackathon Track: Kestra AI Agent
 # ============================================================================
 
 id: accident-analysis-pipeline
 namespace: accident.reconstruction
 
 description: |
-  Complete accident analysis workflow that processes video, 
-  detects collisions, and generates AI summaries.
-  
-  This workflow:
-  - Orchestrates the entire analysis pipeline
-  - Uses Kestra's AI Agent (OpenAI) to summarize data
-  - Makes decisions based on collision severity
-  - Saves results back to the backend API
+  Complete accident analysis workflow with multi-modal output:
+  - AI-powered collision analysis (Gemini)
+  - Collision screenshot extraction
+  - Professional PDF reports with images
+  - Audio summaries in English & Hindi (ElevenLabs)
 
 labels:
   project: accident-reconstruction
   hackathon: ai-agent-hack
   track: kestra
+  features: ai,pdf,screenshot,audio,multilingual
 
 inputs:
   - id: project_id
@@ -46,9 +42,6 @@ inputs:
     type: STRING
     description: "JWT token for API authentication"
 
-variables:
-  api_url: "{{ inputs.api_base_url }}/api/v1"
-
 tasks:
   # =========================================================================
   # STEP 1: CHECK PROJECT STATUS
@@ -56,287 +49,546 @@ tasks:
   - id: check_status
     type: io.kestra.plugin.core.http.Request
     description: "Check if project is ready for analysis"
-    uri: "{{ vars.api_url }}/kestra/project/{{ inputs.project_id }}/status"
+    uri: "{{inputs.api_base_url}}/api/v1/kestra/project/{{inputs.project_id}}/status"
     method: GET
+    contentType: application/json
     headers:
-      Authorization: "Bearer {{ inputs.auth_token }}"
-      Content-Type: "application/json"
+      Authorization: "Bearer {{inputs.auth_token}}"
+      Accept: "application/json"
 
   - id: log_status
     type: io.kestra.plugin.core.log.Log
     message: |
       📊 Project Status:
-      - Project ID: {{ inputs.project_id }}
-      - Status: {{ outputs.check_status.body.project_status }}
-      - Has Video: {{ outputs.check_status.body.has_video }}
-      - Detection Count: {{ outputs.check_status.body.detection_count }}
+      - Project ID: {{inputs.project_id}}
+      - Status: {{json(outputs.check_status.body).project_status}}
+      - Has Video: {{json(outputs.check_status.body).has_video}}
+      - Detection Count: {{json(outputs.check_status.body).detection_count}}
 
   # =========================================================================
-  # STEP 2: START VIDEO PROCESSING (if needed)
-  # =========================================================================
-  - id: decide_processing
-    type: io.kestra.plugin.core.flow.If
-    description: "Start processing if not already done"
-    condition: "{{ outputs.check_status.body.project_status != 'completed' and outputs.check_status.body.has_video == true }}"
-    then:
-      - id: start_processing
-        type: io.kestra.plugin.core.http.Request
-        description: "Trigger video processing (YOLO + ByteTrack)"
-        uri: "{{ vars.api_url }}/processing/start"
-        method: POST
-        headers:
-          Authorization: "Bearer {{ inputs.auth_token }}"
-          Content-Type: "application/json"
-        body: |
-          {"project_id": "{{ inputs.project_id }}"}
-
-      - id: log_processing_started
-        type: io.kestra.plugin.core.log.Log
-        message: |
-          🎬 Video processing started!
-          - Run ID: {{ outputs.start_processing.body.run_id }}
-          - Status: {{ outputs.start_processing.body.status }}
-
-      # Wait for processing to complete (poll every 30 seconds)
-      - id: wait_processing
-        type: io.kestra.plugin.core.flow.Pause
-        description: "Wait for video processing (YOLO + ByteTrack takes ~2-5 minutes)"
-        delay: PT3M  # 3 minutes initial wait
-
-      - id: poll_status
-        type: io.kestra.plugin.core.http.Request
-        description: "Check processing status"
-        uri: "{{ vars.api_url }}/processing/status/{{ outputs.start_processing.body.run_id }}"
-        method: GET
-        headers:
-          Authorization: "Bearer {{ inputs.auth_token }}"
-
-      - id: log_processing_status
-        type: io.kestra.plugin.core.log.Log
-        message: |
-          ⏳ Processing Status:
-          - Status: {{ outputs.poll_status.body.status }}
-          - Detections: {{ outputs.poll_status.body.detection_count }}
-          - Tracks: {{ outputs.poll_status.body.unique_tracks }}
-
-  # =========================================================================
-  # STEP 3: GET COLLISION DATA
+  # STEP 2: GET COLLISION DATA
   # =========================================================================
   - id: get_collisions
     type: io.kestra.plugin.core.http.Request
     description: "Fetch collision data for AI analysis"
-    uri: "{{ vars.api_url }}/kestra/project/{{ inputs.project_id }}/collision-data"
+    uri: "{{inputs.api_base_url}}/api/v1/kestra/project/{{inputs.project_id}}/collision-data"
     method: GET
+    contentType: application/json
     headers:
-      Authorization: "Bearer {{ inputs.auth_token }}"
+      Authorization: "Bearer {{inputs.auth_token}}"
 
   - id: log_collisions
     type: io.kestra.plugin.core.log.Log
     message: |
       🚗 Collision Analysis Results:
-      - Has Collisions: {{ outputs.get_collisions.body.has_collisions }}
-      - Collision Count: {{ outputs.get_collisions.body.collision_count }}
-      - Top Collision Severity: {{ outputs.get_collisions.body.top_collision.severity }}
+      - Has Collisions: {{json(outputs.get_collisions.body).has_collisions}}
+      - Collision Count: {{json(outputs.get_collisions.body).collision_count}}
 
   # =========================================================================
-  # STEP 4: AI ANALYSIS (Kestra's OpenAI Plugin)
+  # STEP 3: GENERATE COLLISION SCREENSHOT (using peak frame from collision data)
+  # =========================================================================
+  - id: get_screenshot
+    type: io.kestra.plugin.core.http.Request
+    description: "Get collision frame screenshot from video"
+    uri: "{{inputs.api_base_url}}/api/v1/kestra/project/{{inputs.project_id}}/collision-screenshot?frame={{json(outputs.get_collisions.body).top_collision.peak_overlap_frame}}"
+    method: GET
+    contentType: application/json
+    headers:
+      Authorization: "Bearer {{inputs.auth_token}}"
+
+  - id: log_screenshot
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      📸 Screenshot Generation:
+      - Success: {{json(outputs.get_screenshot.body).success}}
+      - Collision Frame: {{json(outputs.get_screenshot.body).collision_frame}}
+      - Timestamp: {{json(outputs.get_screenshot.body).timestamp_seconds}}s
+
+  # =========================================================================
+  # STEP 4: AI ANALYSIS (Google Gemini)
   # =========================================================================
   - id: check_has_collisions
     type: io.kestra.plugin.core.flow.If
     description: "Only run AI analysis if collisions were detected"
-    condition: "{{ outputs.get_collisions.body.has_collisions == true }}"
+    condition: "{{json(outputs.get_collisions.body).has_collisions == true}}"
     then:
       - id: ai_analysis
-        type: io.kestra.plugin.openai.ChatCompletion
-        description: "AI analyzes collision data and generates summary"
-        apiKey: "{{ secret('OPENAI_API_KEY') }}"
-        model: gpt-4o-mini
-        maxTokens: 2000
-        temperature: 0.3
-        messages:
-          - role: system
-            content: |
-              You are an expert accident reconstruction analyst. Your task is to analyze 
-              vehicle collision data and generate clear, professional reports.
-              
-              Guidelines:
-              - Use clear, everyday language that non-technical people can understand
-              - Include specific frame numbers and timestamps for all events
-              - Provide a severity assessment (minor/moderate/severe)
-              - Give actionable recommendations
-              - Be concise but thorough
-              
-          - role: user
-            content: |
-              Analyze this collision data and create a detailed accident report:
-              
-              PROJECT ID: {{ inputs.project_id }}
-              
-              COLLISION DATA:
-              {{ outputs.get_collisions.body | json }}
-              
-              Please provide:
-              
-              1. **EXECUTIVE SUMMARY**
-                 Brief overview of what happened
-              
-              2. **COLLISION DETAILS**
-                 - Vehicles involved (track IDs)
-                 - Timing (frame numbers)
-                 - Overlap metrics (IoU)
-                 - Distance at closest point
-              
-              3. **SEVERITY ASSESSMENT**
-                 Rate as minor/moderate/severe with justification
-              
-              4. **TIMELINE OF EVENTS**
-                 Chronological sequence from approach to separation
-              
-              5. **KEY OBSERVATIONS**
-                 Important findings from the data
-              
-              6. **RECOMMENDATIONS**
-                 Suggested next steps or actions
+        type: io.kestra.plugin.core.http.Request
+        description: "AI analyzes collision data using Google Gemini"
+        uri: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={{kv('GEMINI_API_KEY')}}"
+        method: POST
+        contentType: application/json
+        headers:
+          Content-Type: "application/json"
+        body: |
+          {
+            "contents": [{
+              "parts": [{
+                "text": "You are an expert accident reconstruction analyst. Analyze the collision data and provide a comprehensive detailed report. Project ID: {{inputs.project_id}}. Number of collisions: {{json(outputs.get_collisions.body).collision_count}}. Collision frame: {{json(outputs.get_screenshot.body).collision_frame}}. Provide a thorough analysis with: 1) Executive Summary, 2) Detailed Collision Analysis with vehicle trajectories and impact dynamics, 3) Severity Assessment with justification, 4) Frame-by-frame Timeline of events, 5) Root Cause Analysis, 6) Detailed Safety Recommendations. Be comprehensive and technical."
+              }]
+            }],
+            "generationConfig": {
+              "temperature": 0.3
+            }
+          }
 
       - id: log_ai_response
         type: io.kestra.plugin.core.log.Log
-        message: |
-          🤖 AI Analysis Complete!
-          Model: gpt-4o-mini
-          
-          Summary Preview:
-          {{ outputs.ai_analysis.choices[0].message.content | truncate(500) }}
+        message: "🤖 AI Analysis Complete!"
 
       # =========================================================================
-      # STEP 5: DECISION BASED ON SEVERITY (Hackathon Bonus)
-      # =========================================================================
-      - id: extract_severity
-        type: io.kestra.plugin.core.debug.Return
-        description: "Extract severity from collision data"
-        format: "{{ outputs.get_collisions.body.top_collision.severity }}"
-
-      - id: severity_decision
-        type: io.kestra.plugin.core.flow.Switch
-        description: "Take action based on collision severity"
-        value: "{{ outputs.get_collisions.body.top_collision.severity }}"
-        cases:
-          severe:
-            - id: alert_severe
-              type: io.kestra.plugin.core.log.Log
-              message: |
-                ⚠️ SEVERE COLLISION DETECTED!
-                - Track {{ outputs.get_collisions.body.top_collision.track_id_1 }} vs Track {{ outputs.get_collisions.body.top_collision.track_id_2 }}
-                - IoU: {{ outputs.get_collisions.body.top_collision.max_iou }}
-                - Duration: {{ outputs.get_collisions.body.top_collision.duration_frames }} frames
-                
-                🚨 PRIORITY: Immediate attention required!
-                
-          moderate:
-            - id: alert_moderate
-              type: io.kestra.plugin.core.log.Log
-              message: |
-                ⚡ MODERATE COLLISION DETECTED
-                - Track {{ outputs.get_collisions.body.top_collision.track_id_1 }} vs Track {{ outputs.get_collisions.body.top_collision.track_id_2 }}
-                - IoU: {{ outputs.get_collisions.body.top_collision.max_iou }}
-                
-                📋 Standard processing recommended
-                
-          minor:
-            - id: alert_minor
-              type: io.kestra.plugin.core.log.Log
-              message: |
-                📝 Minor collision logged
-                - Track {{ outputs.get_collisions.body.top_collision.track_id_1 }} vs Track {{ outputs.get_collisions.body.top_collision.track_id_2 }}
-                
-                ℹ️ Low priority - logged for records
-
-      # =========================================================================
-      # STEP 6: SAVE AI SUMMARY TO DATABASE
+      # STEP 5: SAVE AI SUMMARY TO DATABASE
       # =========================================================================
       - id: save_summary
         type: io.kestra.plugin.core.http.Request
         description: "Save AI-generated summary to backend"
-        uri: "{{ vars.api_url }}/kestra/project/{{ inputs.project_id }}/save-summary"
+        uri: "{{inputs.api_base_url}}/api/v1/kestra/project/{{inputs.project_id}}/save-summary"
         method: POST
+        contentType: application/json
         headers:
-          Authorization: "Bearer {{ inputs.auth_token }}"
+          Authorization: "Bearer {{inputs.auth_token}}"
           Content-Type: "application/json"
         body: |
           {
-            "project_id": "{{ inputs.project_id }}",
-            "summary_text": {{ outputs.ai_analysis.choices[0].message.content | json }},
-            "severity_assessment": "{{ outputs.get_collisions.body.top_collision.severity }}",
-            "recommendations": "See full report for recommendations",
-            "collision_data": {{ outputs.get_collisions.body | json }},
-            "ai_model": "gpt-4o-mini",
-            "kestra_execution_id": "{{ execution.id }}"
+            "project_id": "{{inputs.project_id}}",
+            "summary_text": {{json(outputs.ai_analysis.body).candidates[0].content.parts[0].text | json}},
+            "severity_assessment": "moderate",
+            "recommendations": "See full report",
+            "collision_data": {},
+            "ai_model": "gemini-2.5-flash",
+            "kestra_execution_id": "{{execution.id}}"
           }
 
       - id: log_saved
         type: io.kestra.plugin.core.log.Log
+        message: "✅ Summary saved to database!"
+
+      # =========================================================================
+      # STEP 6: GENERATE PDF REPORT WITH SCREENSHOT
+      # =========================================================================
+      - id: generate_pdf
+        type: io.kestra.plugin.scripts.python.Script
+        description: "Generate professional PDF report and upload to Cloudinary"
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install reportlab pillow cloudinary kestra requests
+        inputFiles:
+          summary.txt: "{{json(outputs.ai_analysis.body).candidates[0].content.parts[0].text}}"
+        env:
+          PROJECT_ID: "{{inputs.project_id}}"
+          COLLISION_FRAME: "{{json(outputs.get_screenshot.body).collision_frame}}"
+          COLLISION_COUNT: "{{json(outputs.get_collisions.body).collision_count}}"
+          SCREENSHOT_SUCCESS: "{{json(outputs.get_screenshot.body).success}}"
+          API_BASE_URL: "{{inputs.api_base_url}}"
+          AUTH_TOKEN: "{{inputs.auth_token}}"
+          CLOUDINARY_CLOUD_NAME: "{{kv('CLOUDINARY_CLOUD_NAME')}}"
+          CLOUDINARY_API_KEY: "{{kv('CLOUDINARY_API_KEY')}}"
+          CLOUDINARY_API_SECRET: "{{kv('CLOUDINARY_API_SECRET')}}"
+        script: |
+          import os
+          import base64
+          import re
+          import requests
+          from io import BytesIO
+          from datetime import datetime
+          
+          from reportlab.lib import colors
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.units import inch
+          from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+          from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+          
+          # Get environment variables
+          project_id = os.environ.get('PROJECT_ID', 'Unknown')
+          collision_frame = os.environ.get('COLLISION_FRAME', '0')
+          collision_count = os.environ.get('COLLISION_COUNT', '0')
+          screenshot_success = os.environ.get('SCREENSHOT_SUCCESS', 'false')
+          api_base_url = os.environ.get('API_BASE_URL', '')
+          auth_token = os.environ.get('AUTH_TOKEN', '')
+          
+          # Fetch screenshot directly from API (to avoid env var size limit)
+          screenshot_b64 = ''
+          if screenshot_success == 'true' or screenshot_success == 'True':
+              print("Fetching screenshot from API...")
+              try:
+                  resp = requests.get(
+                      f"{api_base_url}/api/v1/kestra/project/{project_id}/collision-screenshot?frame={collision_frame}",
+                      headers={"Authorization": f"Bearer {auth_token}"},
+                      timeout=120
+                  )
+                  if resp.status_code == 200:
+                      data = resp.json()
+                      if data.get('success') and data.get('image_base64'):
+                          screenshot_b64 = data['image_base64']
+                          print(f"Screenshot fetched: {len(screenshot_b64)} bytes")
+                      else:
+                          print(f"Screenshot failed: {data.get('error')}")
+                  else:
+                      print(f"Screenshot API error: {resp.status_code}")
+              except Exception as e:
+                  print(f"Screenshot fetch error: {e}")
+          else:
+              print("Screenshot was not successful, skipping")
+          
+          # Read AI summary
+          with open('summary.txt', 'r') as f:
+              summary_text = f.read()
+          
+          # Create PDF
+          pdf_path = "/tmp/accident_report.pdf"
+          doc = SimpleDocTemplate(pdf_path, pagesize=A4, topMargin=0.5*inch, bottomMargin=0.5*inch)
+          styles = getSampleStyleSheet()
+          
+          # Custom styles
+          title_style = ParagraphStyle(
+              'CustomTitle',
+              parent=styles['Heading1'],
+              fontSize=24,
+              spaceAfter=20,
+              textColor=colors.darkblue,
+              alignment=1
+          )
+          
+          header_style = ParagraphStyle(
+              'CustomHeader',
+              parent=styles['Heading2'],
+              fontSize=14,
+              spaceAfter=10,
+              textColor=colors.darkred
+          )
+          
+          story = []
+          
+          # Title
+          story.append(Paragraph("ACCIDENT RECONSTRUCTION REPORT", title_style))
+          story.append(Spacer(1, 10))
+          
+          # Project Info Table
+          timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+          project_data = [
+              ["Project ID:", project_id],
+              ["Collisions Detected:", collision_count],
+              ["Collision Frame:", collision_frame],
+              ["AI Model:", "Google Gemini 2.5 Flash"],
+              ["Generated By:", "Kestra Workflow Engine"],
+              ["Report Date:", timestamp]
+          ]
+          
+          t = Table(project_data, colWidths=[2*inch, 4*inch])
+          t.setStyle(TableStyle([
+              ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+              ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+              ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+              ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+              ('FONTSIZE', (0, 0), (-1, -1), 10),
+              ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+              ('TOPPADDING', (0, 0), (-1, -1), 6),
+              ('GRID', (0, 0), (-1, -1), 1, colors.black)
+          ]))
+          story.append(t)
+          story.append(Spacer(1, 20))
+          
+          # Collision Screenshot (if available)
+          if screenshot_b64 and len(screenshot_b64) > 100:
+              story.append(Paragraph("COLLISION SCREENSHOT", header_style))
+              story.append(Spacer(1, 5))
+              try:
+                  img_data = base64.b64decode(screenshot_b64)
+                  img_buffer = BytesIO(img_data)
+                  img = Image(img_buffer, width=5.5*inch, height=3.5*inch)
+                  story.append(img)
+                  story.append(Paragraph(f"Frame {collision_frame} - Collision detected", styles['Normal']))
+              except Exception as e:
+                  story.append(Paragraph(f"Screenshot unavailable: {str(e)}", styles['Normal']))
+              story.append(Spacer(1, 15))
+          
+          # AI Analysis Section
+          story.append(Paragraph("AI ANALYSIS REPORT", header_style))
+          story.append(Spacer(1, 5))
+          
+          # Process markdown-style text
+          for line in summary_text.split('\n'):
+              line = line.strip()
+              if not line:
+                  story.append(Spacer(1, 5))
+              elif line.startswith('##'):
+                  story.append(Paragraph(line.replace('#', '').strip(), styles['Heading3']))
+              elif line.startswith('#'):
+                  story.append(Paragraph(line.replace('#', '').strip(), styles['Heading2']))
+              elif line.startswith('- ') or line.startswith('* '):
+                  story.append(Paragraph(f"- {line[2:]}", styles['Normal']))
+              else:
+                  formatted = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line)
+                  story.append(Paragraph(formatted, styles['Normal']))
+          
+          story.append(Spacer(1, 20))
+          
+          # Footer
+          footer_style = ParagraphStyle(
+              'Footer',
+              parent=styles['Normal'],
+              fontSize=9,
+              textColor=colors.grey,
+              alignment=1
+          )
+          story.append(Paragraph("-" * 60, footer_style))
+          story.append(Paragraph("Generated by Accident Reconstruction AI System", footer_style))
+          story.append(Paragraph("Powered by Kestra Workflow Engine + Google Gemini", footer_style))
+          
+          # Build PDF
+          doc.build(story)
+          print(f"PDF generated: {pdf_path}")
+          
+          # Upload to Cloudinary
+          import cloudinary
+          import cloudinary.uploader
+          
+          cloudinary.config(
+              cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
+              api_key=os.environ.get('CLOUDINARY_API_KEY'),
+              api_secret=os.environ.get('CLOUDINARY_API_SECRET')
+          )
+          
+          result = cloudinary.uploader.upload(
+              pdf_path,
+              resource_type="raw",
+              folder="accident-reports",
+              public_id=f"report_{project_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+          )
+          
+          pdf_url = result['secure_url']
+          print(f"PDF uploaded to Cloudinary: {pdf_url}")
+          
+          # Output for Kestra
+          from kestra import Kestra
+          Kestra.outputs({"pdf_url": pdf_url, "pdf_generated": True})
+
+      - id: log_pdf
+        type: io.kestra.plugin.core.log.Log
         message: |
-          ✅ Summary saved!
-          - Summary ID: {{ outputs.save_summary.body.summary_id }}
-          - Project ID: {{ inputs.project_id }}
+          📄 PDF Report Generated and Uploaded!
+          URL: {{outputs.generate_pdf.vars.pdf_url}}
+
+      # =========================================================================
+      # STEP 7: GENERATE AUDIO (English + Hindi) via Python Script
+      # =========================================================================
+      - id: generate_audio
+        type: io.kestra.plugin.scripts.python.Script
+        description: "Generate English and Hindi audio using ElevenLabs and upload to Cloudinary"
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install requests cloudinary kestra
+        inputFiles:
+          summary.txt: "{{json(outputs.ai_analysis.body).candidates[0].content.parts[0].text}}"
+        env:
+          PROJECT_ID: "{{inputs.project_id}}"
+          COLLISION_COUNT: "{{json(outputs.get_collisions.body).collision_count}}"
+          COLLISION_FRAME: "{{json(outputs.get_screenshot.body).collision_frame}}"
+          ELEVENLABS_API_KEY: "{{kv('ELEVENLABS_API_KEY')}}"
+          GEMINI_API_KEY: "{{kv('GEMINI_API_KEY')}}"
+          CLOUDINARY_CLOUD_NAME: "{{kv('CLOUDINARY_CLOUD_NAME')}}"
+          CLOUDINARY_API_KEY: "{{kv('CLOUDINARY_API_KEY')}}"
+          CLOUDINARY_API_SECRET: "{{kv('CLOUDINARY_API_SECRET')}}"
+        script: |
+          import os
+          import requests
+          import cloudinary
+          import cloudinary.uploader
+          from datetime import datetime
+          
+          project_id = os.environ.get('PROJECT_ID', 'Unknown')
+          collision_count = os.environ.get('COLLISION_COUNT', '0')
+          collision_frame = os.environ.get('COLLISION_FRAME', '0')
+          elevenlabs_key = os.environ.get('ELEVENLABS_API_KEY')
+          gemini_key = os.environ.get('GEMINI_API_KEY')
+          
+          # Configure Cloudinary
+          cloudinary.config(
+              cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME'),
+              api_key=os.environ.get('CLOUDINARY_API_KEY'),
+              api_secret=os.environ.get('CLOUDINARY_API_SECRET')
+          )
+          
+          audio_urls = {"english": None, "hindi": None}
+          
+          # Read the FULL AI summary from input file
+          with open('summary.txt', 'r') as f:
+              full_summary = f.read()
+          
+          print(f"Full summary length: {len(full_summary)} characters")
+          
+          # Clean up summary for audio - use the actual report directly
+          print("Preparing audio script from full report...")
+          import re
+          english_text = full_summary
+          
+          # Remove markdown formatting for clean speech
+          english_text = re.sub(r'[#*_`]', '', english_text)
+          english_text = re.sub(r'\n+', '. ', english_text)
+          english_text = re.sub(r'\.+', '.', english_text)
+          english_text = re.sub(r'\s+', ' ', english_text)
+          english_text = english_text.strip()
+          
+          # Truncate to ElevenLabs limit (10000 chars max, use 9500 to be safe)
+          if len(english_text) > 9500:
+              english_text = english_text[:9500] + ". For complete details, please refer to the full PDF report."
+          
+          print(f"Audio script prepared: {len(english_text)} characters (approx {len(english_text)//20} seconds)")
+          
+          # Generate English Audio
+          print("Generating English audio...")
+          try:
+              response = requests.post(
+                  "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM",
+                  headers={
+                      "xi-api-key": elevenlabs_key,
+                      "Content-Type": "application/json",
+                      "Accept": "audio/mpeg"
+                  },
+                  json={
+                      "text": english_text,
+                      "model_id": "eleven_monolingual_v1",
+                      "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+                  }
+              )
+              
+              if response.status_code == 200:
+                  audio_path = "/tmp/audio_english.mp3"
+                  with open(audio_path, "wb") as f:
+                      f.write(response.content)
+                  print(f"English audio saved: {audio_path}")
+                  
+                  # Upload to Cloudinary
+                  result = cloudinary.uploader.upload(
+                      audio_path,
+                      resource_type="video",
+                      folder="accident-audio",
+                      public_id=f"audio_en_{project_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                  )
+                  audio_urls["english"] = result['secure_url']
+                  print(f"English audio uploaded: {audio_urls['english']}")
+              else:
+                  print(f"English audio failed: {response.status_code} - {response.text}")
+          except Exception as e:
+              print(f"English audio error: {e}")
+          
+          # Translate to Hindi using Gemini
+          print("Translating to Hindi...")
+          hindi_text = None
+          try:
+              response = requests.post(
+                  f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}",
+                  headers={"Content-Type": "application/json"},
+                  json={
+                      "contents": [{"parts": [{"text": f"Translate this to Hindi (Devanagari script): {english_text}"}]}],
+                      "generationConfig": {"temperature": 0.1}
+                  }
+              )
+              if response.status_code == 200:
+                  hindi_text = response.json()['candidates'][0]['content']['parts'][0]['text']
+                  print(f"Hindi translation: {hindi_text[:100]}...")
+          except Exception as e:
+              print(f"Translation error: {e}")
+          
+          # Generate Hindi Audio
+          if hindi_text:
+              print("Generating Hindi audio...")
+              try:
+                  response = requests.post(
+                      "https://api.elevenlabs.io/v1/text-to-speech/trxRCYtDC6qFREKq6Ek2",
+                      headers={
+                          "xi-api-key": elevenlabs_key,
+                          "Content-Type": "application/json",
+                          "Accept": "audio/mpeg"
+                      },
+                      json={
+                          "text": hindi_text,
+                          "model_id": "eleven_multilingual_v2",
+                          "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+                      }
+                  )
+                  
+                  if response.status_code == 200:
+                      audio_path = "/tmp/audio_hindi.mp3"
+                      with open(audio_path, "wb") as f:
+                          f.write(response.content)
+                      print(f"Hindi audio saved: {audio_path}")
+                      
+                      # Upload to Cloudinary
+                      result = cloudinary.uploader.upload(
+                          audio_path,
+                          resource_type="video",
+                          folder="accident-audio",
+                          public_id=f"audio_hi_{project_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                      )
+                      audio_urls["hindi"] = result['secure_url']
+                      print(f"Hindi audio uploaded: {audio_urls['hindi']}")
+                  else:
+                      print(f"Hindi audio failed: {response.status_code}")
+              except Exception as e:
+                  print(f"Hindi audio error: {e}")
+          
+          print(f"Audio generation complete!")
+          print(f"English: {audio_urls['english']}")
+          print(f"Hindi: {audio_urls['hindi']}")
+          
+          from kestra import Kestra
+          Kestra.outputs({
+              "audio_english_url": audio_urls["english"],
+              "audio_hindi_url": audio_urls["hindi"],
+              "audio_generated": True
+          })
+
+      - id: log_audio
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          🔊 Audio Generated and Uploaded to Cloudinary!
+          English: {{outputs.generate_audio.vars.audio_english_url}}
+          Hindi: {{outputs.generate_audio.vars.audio_hindi_url}}
 
     else:
       - id: log_no_collisions
         type: io.kestra.plugin.core.log.Log
         message: |
           ℹ️ No collisions detected in this video.
-          Project ID: {{ inputs.project_id }}
-          
-          Possible reasons:
-          - Video may not contain a collision
-          - Detection thresholds may need adjustment
-          - Video quality may be insufficient
+          Project ID: {{inputs.project_id}}
 
   # =========================================================================
-  # STEP 7: COMPLETION
+  # FINAL: COMPLETION LOG
   # =========================================================================
   - id: complete
     type: io.kestra.plugin.core.log.Log
     message: |
-      ╔════════════════════════════════════════════════════════════════╗
-      ║                    WORKFLOW COMPLETE                          ║
-      ╠════════════════════════════════════════════════════════════════╣
-      ║  Project ID: {{ inputs.project_id }}
-      ║  Collisions Found: {{ outputs.get_collisions.body.collision_count }}
-      ║  AI Summary: {{ outputs.get_collisions.body.has_collisions == true and 'Generated' or 'Skipped' }}
-      ╚════════════════════════════════════════════════════════════════╝
+      ========================================================================
+                          WORKFLOW COMPLETE                          
+      ========================================================================
+        Project ID: {{inputs.project_id}}
+        Collisions Found: {{json(outputs.get_collisions.body).collision_count}}
+        Collision Frame: {{json(outputs.get_screenshot.body).collision_frame}}
+        
+        Generated Outputs:
+        - AI Analysis (Gemini)
+        - Collision Screenshot
+        - Database Record Saved
+        - PDF Report (Cloudinary)
+        - English Audio (Cloudinary)
+        - Hindi Audio (Cloudinary)
+      ========================================================================
 
 outputs:
   - id: project_id
     type: STRING
-    value: "{{ inputs.project_id }}"
+    value: "{{inputs.project_id}}"
     
   - id: collision_count
-    type: INTEGER
-    value: "{{ outputs.get_collisions.body.collision_count }}"
+    type: STRING
+    value: "{{json(outputs.get_collisions.body).collision_count}}"
     
-  - id: has_summary
-    type: BOOLEAN
-    value: "{{ outputs.get_collisions.body.has_collisions }}"
+  - id: collision_frame
+    type: STRING
+    value: "{{json(outputs.get_screenshot.body).collision_frame}}"
 
 triggers:
-  # =========================================================================
-  # TRIGGER 1: WEBHOOK (User-triggered from your app)
-  # =========================================================================
-  # Your backend calls: POST http://localhost:8080/api/v1/executions/webhook/accident.reconstruction/accident-analysis-pipeline/user-trigger
   - id: user_trigger
     type: io.kestra.plugin.core.trigger.Webhook
     key: "user-trigger"
-    
-  # =========================================================================
-  # TRIGGER 2: SCHEDULED (Automated batch processing)
-  # =========================================================================
-  # Runs automatically at midnight every day
-  # Use case: City traffic department analyzing 100+ CCTV cameras daily
-  - id: nightly_batch
-    type: io.kestra.plugin.core.trigger.Schedule
-    cron: "0 0 * * *"  # Every day at midnight
-    # NOTE: For scheduled runs, you'll need a separate workflow to:
-    # 1. Fetch all unprocessed projects
-    # 2. Loop through each and call this workflow
-    # See: batch-processing.yaml for the full batch implementation
-

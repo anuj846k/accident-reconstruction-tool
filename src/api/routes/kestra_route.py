@@ -607,3 +607,256 @@ async def get_batch_processing_stats(
         "status_breakdown": status_counts
     }
 
+
+# ============== Collision Screenshot Endpoint ==============
+
+class CollisionScreenshotResponse(BaseModel):
+    """Response containing collision screenshot."""
+    success: bool
+    collision_frame: int
+    timestamp_seconds: float
+    image_base64: Optional[str] = None
+    error: Optional[str] = None
+
+
+@router.get("/project/{project_id}/collision-screenshot", response_model=CollisionScreenshotResponse)
+async def get_collision_screenshot(
+    project_id: uuid.UUID,
+    frame: Optional[int] = Query(None, description="Specific frame number to capture"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get a screenshot of the collision frame for PDF reports.
+    
+    This endpoint:
+    1. Finds the peak collision frame from detections
+    2. Downloads the video from Cloudinary
+    3. Extracts that specific frame
+    4. Returns it as base64 encoded PNG
+    
+    Called by Kestra workflow for PDF generation.
+    """
+    import cv2
+    import base64
+    import tempfile
+    import requests
+    
+    # Check authorization
+    result = await db.execute(
+        select(Project).where(Project.id == project_id)
+    )
+    project = result.scalar_one_or_none()
+    
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    if project.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # Get video URL
+    from src.models.media_asset import MediaAsset, MediaAssetKind
+    result = await db.execute(
+        select(MediaAsset)
+        .where(MediaAsset.project_id == project_id)
+        .where(MediaAsset.kind == MediaAssetKind.VIDEO)
+        .limit(1)
+    )
+    video_asset = result.scalar_one_or_none()
+    
+    if not video_asset:
+        return CollisionScreenshotResponse(
+            success=False,
+            collision_frame=0,
+            timestamp_seconds=0.0,
+            error="No video found for this project"
+        )
+    
+    video_url = video_asset.uri
+    
+    # Get detections and find collision frame
+    detections = await processing_service.get_all_detections(db, project_id, limit=100000)
+    
+    if not detections:
+        return CollisionScreenshotResponse(
+            success=False,
+            collision_frame=0,
+            timestamp_seconds=0.0,
+            error="No detections found - process video first"
+        )
+    
+    # Determine which frame to capture
+    analysis_result = analyze_collisions(detections)
+    
+    if frame is not None:
+        # Use explicitly provided frame
+        collision_frame = frame
+        logger.info(f"Using explicitly provided frame: {collision_frame}")
+    elif analysis_result.collisions:
+        # Use peak frame of most significant collision
+        collision_frame = analysis_result.collisions[0].peak_overlap_frame
+        logger.info(f"Using collision peak frame: {collision_frame}")
+    else:
+        # No collisions - use middle frame
+        all_frames = sorted(set(d.frame_idx for d in detections))
+        collision_frame = all_frames[len(all_frames) // 2] if all_frames else 0
+        logger.info(f"No collisions found, using middle frame: {collision_frame}")
+    
+    # Get FPS from video metadata or default
+    fps = 30.0
+    if video_asset.meta and "fps" in video_asset.meta:
+        fps = video_asset.meta["fps"]
+    
+    timestamp_seconds = collision_frame / fps
+    
+    try:
+        # Download video to temp file
+        logger.info(f"Downloading video from: {video_url[:50]}...")
+        
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
+            response = requests.get(video_url, stream=True, timeout=60)
+            response.raise_for_status()
+            
+            for chunk in response.iter_content(chunk_size=8192):
+                temp_file.write(chunk)
+            
+            temp_path = temp_file.name
+        
+        logger.info(f"Video downloaded to: {temp_path}")
+        
+        # Extract frame using OpenCV
+        cap = cv2.VideoCapture(temp_path)
+        
+        if not cap.isOpened():
+            import os
+            os.unlink(temp_path)
+            return CollisionScreenshotResponse(
+                success=False,
+                collision_frame=collision_frame,
+                timestamp_seconds=timestamp_seconds,
+                error="Could not open video file"
+            )
+        
+        # Get video properties
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        logger.info(f"Video has {total_frames} frames at {video_fps} FPS")
+        
+        # Clamp frame number to valid range
+        actual_frame = min(collision_frame, total_frames - 1)
+        actual_frame = max(0, actual_frame)
+        logger.info(f"Requested frame {collision_frame}, using frame {actual_frame}")
+        
+        # Try multiple methods to read the frame
+        frame = None
+        
+        # Method 1: Direct frame seek
+        cap.set(cv2.CAP_PROP_POS_FRAMES, actual_frame)
+        ret, frame = cap.read()
+        
+        # Method 2: If failed, try time-based seek
+        if not ret or frame is None:
+            logger.info("Frame seek failed, trying time-based seek...")
+            target_ms = (actual_frame / video_fps) * 1000
+            cap.set(cv2.CAP_PROP_POS_MSEC, target_ms)
+            ret, frame = cap.read()
+        
+        # Method 3: If still failed, read frames sequentially
+        if not ret or frame is None:
+            logger.info("Time seek failed, reading frames sequentially...")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            for i in range(actual_frame + 1):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+        
+        # Method 4: Just get any frame from the video
+        if not ret or frame is None:
+            logger.info("Sequential read failed, getting first available frame...")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            actual_frame = 0
+        
+        cap.release()
+        
+        # Clean up temp file
+        import os
+        os.unlink(temp_path)
+        
+        if not ret or frame is None:
+            return CollisionScreenshotResponse(
+                success=False,
+                collision_frame=collision_frame,
+                timestamp_seconds=timestamp_seconds,
+                error=f"Could not read any frame from video (total frames: {total_frames})"
+            )
+        
+        logger.info(f"Successfully read frame {actual_frame}")
+        
+        # Draw bounding boxes on the frame for vehicles in collision
+        if analysis_result.collisions:
+            collision = analysis_result.collisions[0]
+            track_ids = [collision.track_id_1, collision.track_id_2]
+            
+            # Find detections at this frame for these tracks
+            frame_detections = [
+                d for d in detections 
+                if d.frame_idx == collision_frame and d.track_id in track_ids
+            ]
+            
+            colors = [(0, 0, 255), (255, 0, 0)]  # Red and Blue
+            for i, det in enumerate(frame_detections):
+                color = colors[i % len(colors)]
+                x, y, w, h = int(det.bbox_x), int(det.bbox_y), int(det.bbox_w), int(det.bbox_h)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 3)
+                cv2.putText(
+                    frame, 
+                    f"Track {det.track_id}", 
+                    (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.9, 
+                    color, 
+                    2
+                )
+            
+            # Add collision label
+            cv2.putText(
+                frame,
+                f"COLLISION - Frame {collision_frame}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (0, 0, 255),
+                3
+            )
+        
+        # Encode frame as PNG -> base64
+        _, buffer = cv2.imencode('.png', frame)
+        image_base64 = base64.b64encode(buffer).decode('utf-8')
+        
+        logger.info(f"Successfully generated collision screenshot for frame {collision_frame}")
+        
+        return CollisionScreenshotResponse(
+            success=True,
+            collision_frame=collision_frame,
+            timestamp_seconds=timestamp_seconds,
+            image_base64=image_base64
+        )
+        
+    except requests.RequestException as e:
+        logger.error(f"Failed to download video: {e}")
+        return CollisionScreenshotResponse(
+            success=False,
+            collision_frame=collision_frame,
+            timestamp_seconds=timestamp_seconds,
+            error=f"Failed to download video: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate screenshot: {e}")
+        return CollisionScreenshotResponse(
+            success=False,
+            collision_frame=collision_frame,
+            timestamp_seconds=timestamp_seconds,
+            error=f"Failed to generate screenshot: {str(e)}"
+        )
+

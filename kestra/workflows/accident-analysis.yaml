@@ -1,0 +1,342 @@
+# ============================================================================
+# ACCIDENT ANALYSIS WORKFLOW - Kestra Orchestration
+# ============================================================================
+# 
+# This workflow orchestrates the complete accident analysis pipeline:
+#   1. Start video processing (YOLO + ByteTrack)
+#   2. Wait for processing to complete
+#   3. Get collision data
+#   4. AI analyzes collisions (OpenAI GPT-4)
+#   5. Make decisions based on severity
+#   6. Save AI summary to database
+#
+# Replaces Celery for background task orchestration.
+# Satisfies Kestra hackathon track requirement.
+# ============================================================================
+
+id: accident-analysis-pipeline
+namespace: accident.reconstruction
+
+description: |
+  Complete accident analysis workflow that processes video, 
+  detects collisions, and generates AI summaries.
+  
+  This workflow:
+  - Orchestrates the entire analysis pipeline
+  - Uses Kestra's AI Agent (OpenAI) to summarize data
+  - Makes decisions based on collision severity
+  - Saves results back to the backend API
+
+labels:
+  project: accident-reconstruction
+  hackathon: ai-agent-hack
+  track: kestra
+
+inputs:
+  - id: project_id
+    type: STRING
+    description: "UUID of the project to analyze"
+    
+  - id: api_base_url
+    type: STRING
+    description: "Base URL of the FastAPI backend"
+    defaults: "http://host.docker.internal:8000"
+    
+  - id: auth_token
+    type: STRING
+    description: "JWT token for API authentication"
+
+variables:
+  api_url: "{{ inputs.api_base_url }}/api/v1"
+
+tasks:
+  # =========================================================================
+  # STEP 1: CHECK PROJECT STATUS
+  # =========================================================================
+  - id: check_status
+    type: io.kestra.plugin.core.http.Request
+    description: "Check if project is ready for analysis"
+    uri: "{{ vars.api_url }}/kestra/project/{{ inputs.project_id }}/status"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ inputs.auth_token }}"
+      Content-Type: "application/json"
+
+  - id: log_status
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      📊 Project Status:
+      - Project ID: {{ inputs.project_id }}
+      - Status: {{ outputs.check_status.body.project_status }}
+      - Has Video: {{ outputs.check_status.body.has_video }}
+      - Detection Count: {{ outputs.check_status.body.detection_count }}
+
+  # =========================================================================
+  # STEP 2: START VIDEO PROCESSING (if needed)
+  # =========================================================================
+  - id: decide_processing
+    type: io.kestra.plugin.core.flow.If
+    description: "Start processing if not already done"
+    condition: "{{ outputs.check_status.body.project_status != 'completed' and outputs.check_status.body.has_video == true }}"
+    then:
+      - id: start_processing
+        type: io.kestra.plugin.core.http.Request
+        description: "Trigger video processing (YOLO + ByteTrack)"
+        uri: "{{ vars.api_url }}/processing/start"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ inputs.auth_token }}"
+          Content-Type: "application/json"
+        body: |
+          {"project_id": "{{ inputs.project_id }}"}
+
+      - id: log_processing_started
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          🎬 Video processing started!
+          - Run ID: {{ outputs.start_processing.body.run_id }}
+          - Status: {{ outputs.start_processing.body.status }}
+
+      # Wait for processing to complete (poll every 30 seconds)
+      - id: wait_processing
+        type: io.kestra.plugin.core.flow.Pause
+        description: "Wait for video processing (YOLO + ByteTrack takes ~2-5 minutes)"
+        delay: PT3M  # 3 minutes initial wait
+
+      - id: poll_status
+        type: io.kestra.plugin.core.http.Request
+        description: "Check processing status"
+        uri: "{{ vars.api_url }}/processing/status/{{ outputs.start_processing.body.run_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ inputs.auth_token }}"
+
+      - id: log_processing_status
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          ⏳ Processing Status:
+          - Status: {{ outputs.poll_status.body.status }}
+          - Detections: {{ outputs.poll_status.body.detection_count }}
+          - Tracks: {{ outputs.poll_status.body.unique_tracks }}
+
+  # =========================================================================
+  # STEP 3: GET COLLISION DATA
+  # =========================================================================
+  - id: get_collisions
+    type: io.kestra.plugin.core.http.Request
+    description: "Fetch collision data for AI analysis"
+    uri: "{{ vars.api_url }}/kestra/project/{{ inputs.project_id }}/collision-data"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ inputs.auth_token }}"
+
+  - id: log_collisions
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      🚗 Collision Analysis Results:
+      - Has Collisions: {{ outputs.get_collisions.body.has_collisions }}
+      - Collision Count: {{ outputs.get_collisions.body.collision_count }}
+      - Top Collision Severity: {{ outputs.get_collisions.body.top_collision.severity }}
+
+  # =========================================================================
+  # STEP 4: AI ANALYSIS (Kestra's OpenAI Plugin)
+  # =========================================================================
+  - id: check_has_collisions
+    type: io.kestra.plugin.core.flow.If
+    description: "Only run AI analysis if collisions were detected"
+    condition: "{{ outputs.get_collisions.body.has_collisions == true }}"
+    then:
+      - id: ai_analysis
+        type: io.kestra.plugin.openai.ChatCompletion
+        description: "AI analyzes collision data and generates summary"
+        apiKey: "{{ secret('OPENAI_API_KEY') }}"
+        model: gpt-4o-mini
+        maxTokens: 2000
+        temperature: 0.3
+        messages:
+          - role: system
+            content: |
+              You are an expert accident reconstruction analyst. Your task is to analyze 
+              vehicle collision data and generate clear, professional reports.
+              
+              Guidelines:
+              - Use clear, everyday language that non-technical people can understand
+              - Include specific frame numbers and timestamps for all events
+              - Provide a severity assessment (minor/moderate/severe)
+              - Give actionable recommendations
+              - Be concise but thorough
+              
+          - role: user
+            content: |
+              Analyze this collision data and create a detailed accident report:
+              
+              PROJECT ID: {{ inputs.project_id }}
+              
+              COLLISION DATA:
+              {{ outputs.get_collisions.body | json }}
+              
+              Please provide:
+              
+              1. **EXECUTIVE SUMMARY**
+                 Brief overview of what happened
+              
+              2. **COLLISION DETAILS**
+                 - Vehicles involved (track IDs)
+                 - Timing (frame numbers)
+                 - Overlap metrics (IoU)
+                 - Distance at closest point
+              
+              3. **SEVERITY ASSESSMENT**
+                 Rate as minor/moderate/severe with justification
+              
+              4. **TIMELINE OF EVENTS**
+                 Chronological sequence from approach to separation
+              
+              5. **KEY OBSERVATIONS**
+                 Important findings from the data
+              
+              6. **RECOMMENDATIONS**
+                 Suggested next steps or actions
+
+      - id: log_ai_response
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          🤖 AI Analysis Complete!
+          Model: gpt-4o-mini
+          
+          Summary Preview:
+          {{ outputs.ai_analysis.choices[0].message.content | truncate(500) }}
+
+      # =========================================================================
+      # STEP 5: DECISION BASED ON SEVERITY (Hackathon Bonus)
+      # =========================================================================
+      - id: extract_severity
+        type: io.kestra.plugin.core.debug.Return
+        description: "Extract severity from collision data"
+        format: "{{ outputs.get_collisions.body.top_collision.severity }}"
+
+      - id: severity_decision
+        type: io.kestra.plugin.core.flow.Switch
+        description: "Take action based on collision severity"
+        value: "{{ outputs.get_collisions.body.top_collision.severity }}"
+        cases:
+          severe:
+            - id: alert_severe
+              type: io.kestra.plugin.core.log.Log
+              message: |
+                ⚠️ SEVERE COLLISION DETECTED!
+                - Track {{ outputs.get_collisions.body.top_collision.track_id_1 }} vs Track {{ outputs.get_collisions.body.top_collision.track_id_2 }}
+                - IoU: {{ outputs.get_collisions.body.top_collision.max_iou }}
+                - Duration: {{ outputs.get_collisions.body.top_collision.duration_frames }} frames
+                
+                🚨 PRIORITY: Immediate attention required!
+                
+          moderate:
+            - id: alert_moderate
+              type: io.kestra.plugin.core.log.Log
+              message: |
+                ⚡ MODERATE COLLISION DETECTED
+                - Track {{ outputs.get_collisions.body.top_collision.track_id_1 }} vs Track {{ outputs.get_collisions.body.top_collision.track_id_2 }}
+                - IoU: {{ outputs.get_collisions.body.top_collision.max_iou }}
+                
+                📋 Standard processing recommended
+                
+          minor:
+            - id: alert_minor
+              type: io.kestra.plugin.core.log.Log
+              message: |
+                📝 Minor collision logged
+                - Track {{ outputs.get_collisions.body.top_collision.track_id_1 }} vs Track {{ outputs.get_collisions.body.top_collision.track_id_2 }}
+                
+                ℹ️ Low priority - logged for records
+
+      # =========================================================================
+      # STEP 6: SAVE AI SUMMARY TO DATABASE
+      # =========================================================================
+      - id: save_summary
+        type: io.kestra.plugin.core.http.Request
+        description: "Save AI-generated summary to backend"
+        uri: "{{ vars.api_url }}/kestra/project/{{ inputs.project_id }}/save-summary"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ inputs.auth_token }}"
+          Content-Type: "application/json"
+        body: |
+          {
+            "project_id": "{{ inputs.project_id }}",
+            "summary_text": {{ outputs.ai_analysis.choices[0].message.content | json }},
+            "severity_assessment": "{{ outputs.get_collisions.body.top_collision.severity }}",
+            "recommendations": "See full report for recommendations",
+            "collision_data": {{ outputs.get_collisions.body | json }},
+            "ai_model": "gpt-4o-mini",
+            "kestra_execution_id": "{{ execution.id }}"
+          }
+
+      - id: log_saved
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          ✅ Summary saved!
+          - Summary ID: {{ outputs.save_summary.body.summary_id }}
+          - Project ID: {{ inputs.project_id }}
+
+    else:
+      - id: log_no_collisions
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          ℹ️ No collisions detected in this video.
+          Project ID: {{ inputs.project_id }}
+          
+          Possible reasons:
+          - Video may not contain a collision
+          - Detection thresholds may need adjustment
+          - Video quality may be insufficient
+
+  # =========================================================================
+  # STEP 7: COMPLETION
+  # =========================================================================
+  - id: complete
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ╔════════════════════════════════════════════════════════════════╗
+      ║                    WORKFLOW COMPLETE                          ║
+      ╠════════════════════════════════════════════════════════════════╣
+      ║  Project ID: {{ inputs.project_id }}
+      ║  Collisions Found: {{ outputs.get_collisions.body.collision_count }}
+      ║  AI Summary: {{ outputs.get_collisions.body.has_collisions == true and 'Generated' or 'Skipped' }}
+      ╚════════════════════════════════════════════════════════════════╝
+
+outputs:
+  - id: project_id
+    type: STRING
+    value: "{{ inputs.project_id }}"
+    
+  - id: collision_count
+    type: INTEGER
+    value: "{{ outputs.get_collisions.body.collision_count }}"
+    
+  - id: has_summary
+    type: BOOLEAN
+    value: "{{ outputs.get_collisions.body.has_collisions }}"
+
+triggers:
+  # =========================================================================
+  # TRIGGER 1: WEBHOOK (User-triggered from your app)
+  # =========================================================================
+  # Your backend calls: POST http://localhost:8080/api/v1/executions/webhook/accident.reconstruction/accident-analysis-pipeline/user-trigger
+  - id: user_trigger
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "user-trigger"
+    
+  # =========================================================================
+  # TRIGGER 2: SCHEDULED (Automated batch processing)
+  # =========================================================================
+  # Runs automatically at midnight every day
+  # Use case: City traffic department analyzing 100+ CCTV cameras daily
+  - id: nightly_batch
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 0 * * *"  # Every day at midnight
+    # NOTE: For scheduled runs, you'll need a separate workflow to:
+    # 1. Fetch all unprocessed projects
+    # 2. Loop through each and call this workflow
+    # See: batch-processing.yaml for the full batch implementation
+

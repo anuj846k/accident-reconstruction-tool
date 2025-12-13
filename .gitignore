@@ -1,0 +1,12 @@
+.env
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Model files (large)
+*.pt
+
+# Uploads
+uploads/

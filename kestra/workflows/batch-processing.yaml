@@ -1,0 +1,293 @@
+# ============================================================================
+# BATCH PROCESSING WORKFLOW - Automated CCTV Monitoring
+# ============================================================================
+# 
+# USE CASE: City traffic department analyzing 100+ CCTV cameras daily
+# 
+# This workflow runs automatically (scheduled) and:
+#   1. Fetches all unprocessed projects
+#   2. Processes each video with YOLO + ByteTrack
+#   3. Detects collisions
+#   4. AI analyzes and summarizes each collision
+#   5. Makes decisions based on severity (alert police for severe)
+#   6. Sends daily email report
+#
+# NO HUMAN INVOLVEMENT - fully automated
+# ============================================================================
+
+id: batch-accident-analysis
+namespace: accident.reconstruction
+
+description: |
+  Automated batch processing for CCTV monitoring.
+  Runs at midnight every day, processes all new videos, and sends a summary report.
+  
+  This is the PRODUCTION use case showing Kestra's real value:
+  - Processes 100+ videos automatically
+  - No human operator needed
+  - Decisions made based on severity
+  - Email report sent automatically
+
+labels:
+  project: accident-reconstruction
+  hackathon: ai-agent-hack
+  track: kestra
+  use-case: production-batch
+
+inputs:
+  - id: api_base_url
+    type: STRING
+    description: "Base URL of the FastAPI backend"
+    defaults: "http://host.docker.internal:8000"
+    
+  - id: service_token
+    type: STRING
+    description: "Service account JWT token for automated processing"
+    defaults: "{{ secret('SERVICE_TOKEN') }}"
+    
+  - id: email_recipients
+    type: STRING
+    description: "Email addresses for daily report (comma-separated)"
+    defaults: "traffic-team@city.gov"
+
+variables:
+  api_url: "{{ inputs.api_base_url }}/api/v1"
+
+tasks:
+  # =========================================================================
+  # STEP 1: FETCH ALL UNPROCESSED PROJECTS
+  # =========================================================================
+  - id: fetch_pending_projects
+    type: io.kestra.plugin.core.http.Request
+    description: "Get all projects pending analysis"
+    uri: "{{ vars.api_url }}/kestra/pending-projects"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ inputs.service_token }}"
+      Content-Type: "application/json"
+
+  - id: log_pending
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      📊 Batch Processing Started
+      ═══════════════════════════════════════════════════════════
+      Date: {{ now() | date('yyyy-MM-dd HH:mm:ss') }}
+      Pending Projects: {{ outputs.fetch_pending_projects.body.count }}
+      Project IDs: {{ outputs.fetch_pending_projects.body.project_ids | join(', ') }}
+      ═══════════════════════════════════════════════════════════
+
+  # =========================================================================
+  # STEP 2: CHECK IF THERE ARE PROJECTS TO PROCESS
+  # =========================================================================
+  - id: check_has_projects
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.fetch_pending_projects.body.count > 0 }}"
+    then:
+      # =====================================================================
+      # STEP 3: LOOP THROUGH EACH PROJECT
+      # =====================================================================
+      - id: process_all_projects
+        type: io.kestra.plugin.core.flow.ForEach
+        description: "Process each project in the queue"
+        values: "{{ outputs.fetch_pending_projects.body.project_ids }}"
+        concurrencyLimit: 3  # Process 3 at a time (adjust based on server capacity)
+        tasks:
+          - id: log_processing_project
+            type: io.kestra.plugin.core.log.Log
+            message: |
+              🎬 Processing Project: {{ taskrun.value }}
+              Progress: {{ taskrun.iteration }} / {{ outputs.fetch_pending_projects.body.count }}
+
+          # -------------------------------------------------------------------
+          # STEP 3a: START PROCESSING (YOLO + ByteTrack)
+          # -------------------------------------------------------------------
+          - id: start_processing
+            type: io.kestra.plugin.core.http.Request
+            uri: "{{ vars.api_url }}/processing/start"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ inputs.service_token }}"
+              Content-Type: "application/json"
+            body: |
+              {"project_id": "{{ taskrun.value }}"}
+
+          # Wait for processing
+          - id: wait_processing
+            type: io.kestra.plugin.core.flow.Pause
+            delay: PT3M  # 3 minutes per video
+
+          # -------------------------------------------------------------------
+          # STEP 3b: GET COLLISION DATA
+          # -------------------------------------------------------------------
+          - id: get_collision_data
+            type: io.kestra.plugin.core.http.Request
+            uri: "{{ vars.api_url }}/kestra/project/{{ taskrun.value }}/collision-data"
+            method: GET
+            headers:
+              Authorization: "Bearer {{ inputs.service_token }}"
+
+          # -------------------------------------------------------------------
+          # STEP 3c: AI ANALYSIS (if collision detected)
+          # -------------------------------------------------------------------
+          - id: check_collision
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ outputs.get_collision_data.body.has_collisions == true }}"
+            then:
+              - id: ai_analyze
+                type: io.kestra.plugin.openai.ChatCompletion
+                apiKey: "{{ secret('OPENAI_API_KEY') }}"
+                model: gpt-4o-mini
+                maxTokens: 1000
+                messages:
+                  - role: system
+                    content: "You are an accident reconstruction analyst. Provide brief, clear summaries."
+                  - role: user
+                    content: |
+                      Briefly summarize this collision:
+                      {{ outputs.get_collision_data.body | json }}
+                      
+                      Format: 
+                      - What happened (1-2 sentences)
+                      - Severity: minor/moderate/severe
+                      - Action needed: yes/no
+
+              # -------------------------------------------------------------------
+              # STEP 3d: SEVERITY DECISION
+              # -------------------------------------------------------------------
+              - id: severity_action
+                type: io.kestra.plugin.core.flow.Switch
+                value: "{{ outputs.get_collision_data.body.top_collision.severity }}"
+                cases:
+                  severe:
+                    - id: log_severe_alert
+                      type: io.kestra.plugin.core.log.Log
+                      message: |
+                        🚨 SEVERE COLLISION - Project {{ taskrun.value }}
+                        Immediate attention required!
+                        
+                    # In production, you could send SMS/call:
+                    # - id: alert_police
+                    #   type: io.kestra.plugin.notifications.twilio.TwilioSend
+                    #   message: "Severe collision detected at intersection..."
+                    
+                  moderate:
+                    - id: log_moderate
+                      type: io.kestra.plugin.core.log.Log
+                      message: "⚡ Moderate collision - Project {{ taskrun.value }}"
+                      
+                  minor:
+                    - id: log_minor
+                      type: io.kestra.plugin.core.log.Log
+                      message: "📝 Minor collision logged - Project {{ taskrun.value }}"
+
+              # -------------------------------------------------------------------
+              # STEP 3e: SAVE SUMMARY
+              # -------------------------------------------------------------------
+              - id: save_result
+                type: io.kestra.plugin.core.http.Request
+                uri: "{{ vars.api_url }}/kestra/project/{{ taskrun.value }}/save-summary"
+                method: POST
+                headers:
+                  Authorization: "Bearer {{ inputs.service_token }}"
+                  Content-Type: "application/json"
+                body: |
+                  {
+                    "project_id": "{{ taskrun.value }}",
+                    "summary_text": {{ outputs.ai_analyze.choices[0].message.content | json }},
+                    "severity_assessment": "{{ outputs.get_collision_data.body.top_collision.severity }}",
+                    "ai_model": "gpt-4o-mini",
+                    "kestra_execution_id": "{{ execution.id }}",
+                    "batch_run": true
+                  }
+
+      # =====================================================================
+      # STEP 4: GENERATE BATCH SUMMARY
+      # =====================================================================
+      - id: generate_batch_summary
+        type: io.kestra.plugin.openai.ChatCompletion
+        apiKey: "{{ secret('OPENAI_API_KEY') }}"
+        model: gpt-4o-mini
+        maxTokens: 1000
+        messages:
+          - role: user
+            content: |
+              Create a brief daily summary for the traffic department:
+              
+              - Total videos processed: {{ outputs.fetch_pending_projects.body.count }}
+              - Processing date: {{ now() | date('yyyy-MM-dd') }}
+              
+              Write a 3-4 sentence summary suitable for an email subject and body.
+
+      # =====================================================================
+      # STEP 5: SEND EMAIL REPORT
+      # =====================================================================
+      - id: send_report
+        type: io.kestra.plugin.core.log.Log
+        # In production, use email plugin:
+        # type: io.kestra.plugin.notifications.mail.MailSend
+        # to: "{{ inputs.email_recipients }}"
+        # subject: "Daily Accident Report - {{ now() | date('yyyy-MM-dd') }}"
+        message: |
+          📧 DAILY REPORT WOULD BE SENT TO: {{ inputs.email_recipients }}
+          
+          Subject: Daily Accident Report - {{ now() | date('yyyy-MM-dd') }}
+          
+          Body:
+          {{ outputs.generate_batch_summary.choices[0].message.content }}
+          
+          ═══════════════════════════════════════════════════════════
+          Total Projects Processed: {{ outputs.fetch_pending_projects.body.count }}
+          Kestra Execution ID: {{ execution.id }}
+          ═══════════════════════════════════════════════════════════
+
+    else:
+      - id: log_no_projects
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          ℹ️ No pending projects to process.
+          Date: {{ now() | date('yyyy-MM-dd HH:mm:ss') }}
+          
+          All videos are up to date!
+
+  # =========================================================================
+  # COMPLETION
+  # =========================================================================
+  - id: complete
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      ╔════════════════════════════════════════════════════════════════╗
+      ║              BATCH PROCESSING COMPLETE                        ║
+      ╠════════════════════════════════════════════════════════════════╣
+      ║  Date: {{ now() | date('yyyy-MM-dd HH:mm:ss') }}
+      ║  Projects Processed: {{ outputs.fetch_pending_projects.body.count }}
+      ║  Execution ID: {{ execution.id }}
+      ╚════════════════════════════════════════════════════════════════╝
+
+outputs:
+  - id: processed_count
+    type: INTEGER
+    value: "{{ outputs.fetch_pending_projects.body.count }}"
+    
+  - id: execution_date
+    type: STRING
+    value: "{{ now() | date('yyyy-MM-dd') }}"
+
+triggers:
+  # =========================================================================
+  # SCHEDULED TRIGGER: Runs every day at midnight
+  # =========================================================================
+  - id: nightly_batch
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 0 * * *"  # At 00:00 (midnight) every day
+    
+  # =========================================================================
+  # MANUAL TRIGGER: For testing via webhook
+  # =========================================================================
+  - id: manual_trigger
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "batch-manual"
+
+
+
+
+

@@ -1,0 +1,117 @@
+# ============================================================================
+# AI SUMMARY WORKFLOW - Kestra (Simplified)
+# ============================================================================
+# 
+# This simplified workflow only does AI analysis on already-processed projects:
+#   1. Get collision data from API
+#   2. AI summarizes collisions
+#   3. Make decisions based on severity
+#   4. Save summary
+#
+# Use this when video has already been processed.
+# ============================================================================
+
+id: ai-summary-only
+namespace: accident.reconstruction
+
+description: |
+  Simplified workflow that generates AI summaries for already-processed projects.
+  Use when video processing has already completed.
+
+labels:
+  project: accident-reconstruction
+  hackathon: ai-agent-hack
+  type: simplified
+
+inputs:
+  - id: project_id
+    type: STRING
+    description: "UUID of the project to analyze"
+    
+  - id: api_base_url
+    type: STRING
+    defaults: "http://host.docker.internal:8000"
+    
+  - id: auth_token
+    type: STRING
+    description: "JWT token for API authentication"
+
+variables:
+  api_url: "{{ inputs.api_base_url }}/api/v1"
+
+tasks:
+  # Step 1: Get collision data
+  - id: get_collisions
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ vars.api_url }}/kestra/project/{{ inputs.project_id }}/collision-data"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ inputs.auth_token }}"
+
+  - id: log_data
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      📊 Got collision data:
+      - Collisions: {{ outputs.get_collisions.body.collision_count }}
+      - Severity: {{ outputs.get_collisions.body.top_collision.severity }}
+
+  # Step 2: AI Analysis
+  - id: ai_summary
+    type: io.kestra.plugin.openai.ChatCompletion
+    apiKey: "{{ secret('OPENAI_API_KEY') }}"
+    model: gpt-4o-mini
+    maxTokens: 1500
+    messages:
+      - role: system
+        content: "You are an accident reconstruction expert. Analyze collision data and write clear reports."
+      - role: user
+        content: |
+          Analyze this collision and create a brief report:
+          
+          {{ outputs.get_collisions.body | json }}
+          
+          Include:
+          1. What happened (2-3 sentences)
+          2. Severity assessment
+          3. Key metrics (IoU, frames)
+          4. Recommendation
+
+  # Step 3: Decision (hackathon bonus)
+  - id: severity_check
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.get_collisions.body.top_collision.severity == 'severe' }}"
+    then:
+      - id: alert
+        type: io.kestra.plugin.core.log.Log
+        message: "⚠️ SEVERE collision - priority handling!"
+
+  # Step 4: Save summary
+  - id: save
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ vars.api_url }}/kestra/project/{{ inputs.project_id }}/save-summary"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ inputs.auth_token }}"
+      Content-Type: "application/json"
+    body: |
+      {
+        "project_id": "{{ inputs.project_id }}",
+        "summary_text": {{ outputs.ai_summary.choices[0].message.content | json }},
+        "severity_assessment": "{{ outputs.get_collisions.body.top_collision.severity }}",
+        "ai_model": "gpt-4o-mini",
+        "kestra_execution_id": "{{ execution.id }}"
+      }
+
+  - id: done
+    type: io.kestra.plugin.core.log.Log
+    message: "✅ AI summary saved: {{ outputs.save.body.summary_id }}"
+
+outputs:
+  - id: summary_id
+    type: STRING
+    value: "{{ outputs.save.body.summary_id }}"
+
+
+
+
+

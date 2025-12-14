@@ -44,16 +44,15 @@ class StartProcessingResponse(BaseModel):
     status: str
     message: str
 
-
 class ProcessingStatusResponse(BaseModel):
     """Response with processing status."""
     run_id: uuid.UUID
     status: str
-    total_frames: Optional[int]
-    processed_frames: int
-    detection_count: int
-    unique_tracks: int
-    error_message: Optional[str]
+    total_frames: Optional[int] = None
+    processed_frames: int = 0
+    detection_count: int = 0
+    unique_tracks: int = 0
+    error_message: Optional[str] = None
 
 
 class DetectionResponse(BaseModel):

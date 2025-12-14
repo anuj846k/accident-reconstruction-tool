@@ -260,49 +260,31 @@ def analyze_collisions(
     }
     
     # Filter to find the most significant collision
-    # If we have many collisions, likely from track fragmentation
-    # Find the collision with highest IoU and longest duration
+    # Priority: EARLIEST collision is usually the actual crash
+    # Later collisions are often aftermath (vehicles stuck together)
     if collisions:
-        # Sort by severity and duration
+        # Sort by EARLIEST first_contact_frame (the actual impact moment)
+        # Secondary: higher IoU for tie-breaking
         collisions.sort(
             key=lambda c: (
-                1 if c.severity == "severe" else (2 if c.severity == "moderate" else 3),
-                -c.duration_frames,  # Longer duration = more significant
-                -c.max_iou  # Higher IoU = more significant
+                c.first_contact_frame,  # Earliest collision first (the actual crash)
+                -c.max_iou  # Higher IoU = more significant for tie-breaking
             )
         )
         
-        # If we have many collisions, likely false positives from fragmentation
-        # Take the top collision(s) that are clearly different vehicles
+        # Filter to significant collisions (IoU > threshold)
         significant_collisions = []
-        seen_pairs = set()
-        
         for collision in collisions:
-            # Check if this pair overlaps with any we've already seen
-            # (likely same vehicles with different track IDs)
-            pair_key = tuple(sorted([collision.track_id_1, collision.track_id_2]))
-            
-            # If this is a very long collision (vehicles stuck together), it's likely real
-            is_long_collision = collision.duration_frames > 50
-            
-            # If high IoU and long duration, it's likely the real collision
-            is_significant = (
-                collision.max_iou > 0.2 and 
-                collision.duration_frames > 5
-            ) or is_long_collision
+            # A collision is significant if it has meaningful overlap
+            is_significant = collision.max_iou > 0.15 and collision.duration_frames >= 2
             
             if is_significant:
-                # Check if this pair might be the same as another (fragmented tracks)
-                # Simple heuristic: if tracks are close in number, might be same vehicle
-                # But if collision is long and high IoU, it's likely real
-                if is_long_collision or collision.max_iou > 0.25:
-                    significant_collisions.append(collision)
-                    seen_pairs.add(pair_key)
-                elif len(significant_collisions) < 3:  # Allow up to 3 significant collisions
-                    significant_collisions.append(collision)
-                    seen_pairs.add(pair_key)
+                significant_collisions.append(collision)
+                # Keep up to 3 significant collisions
+                if len(significant_collisions) >= 3:
+                    break
         
-        # If we filtered too much, keep at least the top collision
+        # If we filtered too much, keep at least the earliest collision
         if not significant_collisions and collisions:
             significant_collisions = [collisions[0]]
         

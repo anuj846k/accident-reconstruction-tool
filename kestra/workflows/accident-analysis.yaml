@@ -395,6 +395,9 @@ tasks:
           import cloudinary
           import cloudinary.uploader
           from datetime import datetime
+          from kestra import Kestra
+          
+          audio_urls = {"english": None, "hindi": None}
           
           project_id = os.environ.get('PROJECT_ID', 'Unknown')
           collision_count = os.environ.get('COLLISION_COUNT', '0')
@@ -408,8 +411,6 @@ tasks:
               api_key=os.environ.get('CLOUDINARY_API_KEY'),
               api_secret=os.environ.get('CLOUDINARY_API_SECRET')
           )
-          
-          audio_urls = {"english": None, "hindi": None}
           
           # Read the FULL AI summary from input file
           with open('summary.txt', 'r') as f:
@@ -429,9 +430,10 @@ tasks:
           english_text = re.sub(r'\s+', ' ', english_text)
           english_text = english_text.strip()
           
-          # Truncate to ElevenLabs limit (10000 chars max, use 9500 to be safe)
-          if len(english_text) > 9500:
-              english_text = english_text[:9500] + ". For complete details, please refer to the full PDF report."
+          # Truncate to save ElevenLabs credits (keep it short - ~2 min audio max)
+          # 3000 chars ≈ 2.5 minutes of audio
+          if len(english_text) > 3000:
+              english_text = english_text[:3000] + ". For complete details, please refer to the full PDF report."
           
           print(f"Audio script prepared: {len(english_text)} characters (approx {len(english_text)//20} seconds)")
           
@@ -532,11 +534,11 @@ tasks:
           print(f"English: {audio_urls['english']}")
           print(f"Hindi: {audio_urls['hindi']}")
           
-          from kestra import Kestra
+          # Always output results (with fallbacks for any failures)
           Kestra.outputs({
-              "audio_english_url": audio_urls["english"],
-              "audio_hindi_url": audio_urls["hindi"],
-              "audio_generated": True
+              "audio_english_url": audio_urls.get("english") or "FAILED",
+              "audio_hindi_url": audio_urls.get("hindi") or "FAILED",
+              "audio_generated": audio_urls.get("english") is not None
           })
 
       - id: log_audio

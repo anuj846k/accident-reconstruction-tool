@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Collision Frame Viewer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        h1 {
+            color: #ff6b6b;
+        }
+        textarea {
+            width: 100%;
+            height: 150px;
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 8px;
+            border: 2px solid #444;
+            background: #16213e;
+            color: #eee;
+            font-family: monospace;
+            resize: vertical;
+        }
+        button {
+            background: #ff6b6b;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background: #ee5a5a;
+        }
+        .frame-input {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        .frame-input input {
+            padding: 10px;
+            font-size: 16px;
+            border-radius: 8px;
+            border: 2px solid #444;
+            background: #16213e;
+            color: #eee;
+            width: 100px;
+        }
+        .frame-input input[type="text"] {
+            flex: 1;
+            min-width: 200px;
+        }
+        #imageContainer {
+            margin-top: 20px;
+            text-align: center;
+        }
+        #imageContainer img {
+            max-width: 100%;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+        }
+        .info {
+            background: #16213e;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 10px 0;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 8px;
+            margin: 10px 0;
+        }
+        .success { background: #2d5a27; }
+        .error { background: #5a2727; }
+        .loading { background: #5a4a27; }
+    </style>
+</head>
+<body>
+    <h1>🚗 Collision Frame Viewer</h1>
+    
+    <div class="info">
+        <strong>Project ID:</strong> 
+        <input type="text" id="projectId" value="e232695e-08fb-44e1-a38d-5f6bf481d93c" style="width: 350px; padding: 5px;">
+    </div>
+    
+    <div class="info">
+        <strong>Auth Token:</strong> 
+        <input type="text" id="authToken" placeholder="Paste your JWT token here" style="width: 100%; padding: 5px;">
+    </div>
+
+    <div class="frame-input">
+        <label>Frame Number:</label>
+        <input type="number" id="frameNumber" value="426" min="0">
+        <button onclick="fetchFrame()">📸 Fetch Frame</button>
+    </div>
+
+    <div class="frame-input">
+        <button onclick="fetchFrame(353)">Approach (353)</button>
+        <button onclick="fetchFrame(403)">First Contact (403)</button>
+        <button onclick="fetchFrame(426)">Peak (426)</button>
+        <button onclick="fetchFrame(450)">Mid (450)</button>
+        <button onclick="fetchFrame(500)">Late (500)</button>
+        <button onclick="fetchFrame(601)">Separation (601)</button>
+    </div>
+
+    <div id="status"></div>
+
+    <h3>Or paste Base64 string directly:</h3>
+    <textarea id="base64Input" placeholder="Paste the base64 string here (without the data:image prefix)"></textarea>
+    <button onclick="displayImage()">🖼️ Display Image</button>
+    <button onclick="clearImage()">🗑️ Clear</button>
+
+    <div id="imageContainer"></div>
+
+    <script>
+        async function fetchFrame(frameNum) {
+            const frame = frameNum || document.getElementById('frameNumber').value;
+            const projectId = document.getElementById('projectId').value;
+            const token = document.getElementById('authToken').value;
+            
+            if (!token) {
+                showStatus('Please enter your auth token!', 'error');
+                return;
+            }
+            
+            showStatus(`Fetching frame ${frame}...`, 'loading');
+            
+            try {
+                const response = await fetch(
+                    `http://localhost:8000/api/v1/kestra/project/${projectId}/collision-screenshot?frame=${frame}`,
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${token}`
+                        }
+                    }
+                );
+                
+                const data = await response.json();
+                
+                if (data.success && data.image_base64) {
+                    document.getElementById('base64Input').value = data.image_base64;
+                    displayImage();
+                    showStatus(`✅ Frame ${frame} loaded! (${data.timestamp_seconds.toFixed(2)}s)`, 'success');
+                } else {
+                    showStatus(`❌ Error: ${data.error || 'Unknown error'}`, 'error');
+                }
+            } catch (err) {
+                showStatus(`❌ Fetch error: ${err.message}`, 'error');
+            }
+        }
+
+        function displayImage() {
+            const base64 = document.getElementById('base64Input').value.trim();
+            const container = document.getElementById('imageContainer');
+            
+            if (!base64) {
+                showStatus('Please paste a base64 string or fetch a frame!', 'error');
+                return;
+            }
+            
+            // Remove any data:image prefix if present
+            let cleanBase64 = base64;
+            if (base64.includes(',')) {
+                cleanBase64 = base64.split(',')[1];
+            }
+            
+            container.innerHTML = `<img src="data:image/jpeg;base64,${cleanBase64}" alt="Collision Frame" />`;
+            showStatus('✅ Image displayed!', 'success');
+        }
+
+        function clearImage() {
+            document.getElementById('imageContainer').innerHTML = '';
+            document.getElementById('base64Input').value = '';
+            document.getElementById('status').innerHTML = '';
+        }
+
+        function showStatus(message, type) {
+            document.getElementById('status').innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+    </script>
+</body>
+</html>
+

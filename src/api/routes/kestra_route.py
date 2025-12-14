@@ -224,10 +224,10 @@ async def get_collision_data_for_kestra(
             }
         )
     
-    # Sort by significance (IoU)
+    # Sort by EARLIEST collision first (the actual crash, not aftermath)
     sorted_collisions = sorted(
         analysis_result.collisions,
-        key=lambda c: (-c.max_iou, -c.duration_frames)
+        key=lambda c: (c.first_contact_frame, -c.max_iou)
     )
     
     # Format for AI consumption
@@ -247,7 +247,7 @@ async def get_collision_data_for_kestra(
             "key_frames": key_frames
         })
     
-    # Top collision (highest IoU)
+    # Top collision (earliest = actual crash)
     top_collision = all_collisions[0] if all_collisions else None
     
     unique_tracks = len(set(d.track_id for d in detections if d.track_id))
@@ -367,7 +367,13 @@ async def get_workflow_status(
     collision_count = 0
     if stats.total_detections > 0:
         all_detections = await processing_service.get_all_detections(db, project_id, limit=100000)
-        analysis_result = analyze_collisions(all_detections)
+        analysis_result = analyze_collisions(
+            all_detections,
+            iou_threshold=0.1,
+            distance_threshold=50.0,
+            persistence_frames=3,
+            min_collision_frames=2
+        )
         collision_count = analysis_result.total_collisions
     
     # Check for AI summaries
@@ -686,15 +692,35 @@ async def get_collision_screenshot(
         )
     
     # Determine which frame to capture
-    analysis_result = analyze_collisions(detections)
+    # Use SAME parameters as collision-data endpoint!
+    analysis_result = analyze_collisions(
+        detections,
+        iou_threshold=0.1,
+        distance_threshold=50.0,
+        persistence_frames=3,
+        min_collision_frames=2
+    )
+
+    # IMPORTANT: Keep collision selection consistent with collision-data endpoint.
+    # Priority: EARLIEST collision is usually the actual crash (not aftermath)
+    sorted_collisions = sorted(
+        analysis_result.collisions,
+        key=lambda c: (c.first_contact_frame, -c.max_iou)  # Earliest first, then by IoU
+    ) if analysis_result.collisions else []
+
+    # Always use the EARLIEST collision (the actual crash, not aftermath)
+    collision_to_annotate = sorted_collisions[0] if sorted_collisions else None
+    
+    if collision_to_annotate:
+        logger.info(f"Using earliest collision: Track {collision_to_annotate.track_id_1} vs Track {collision_to_annotate.track_id_2} at frame {collision_to_annotate.first_contact_frame} (IoU={collision_to_annotate.max_iou:.4f})")
     
     if frame is not None:
         # Use explicitly provided frame
         collision_frame = frame
         logger.info(f"Using explicitly provided frame: {collision_frame}")
-    elif analysis_result.collisions:
+    elif collision_to_annotate is not None:
         # Use peak frame of most significant collision
-        collision_frame = analysis_result.collisions[0].peak_overlap_frame
+        collision_frame = collision_to_annotate.peak_overlap_frame
         logger.info(f"Using collision peak frame: {collision_frame}")
     else:
         # No collisions - use middle frame
@@ -747,34 +773,53 @@ async def get_collision_screenshot(
         actual_frame = max(0, actual_frame)
         logger.info(f"Requested frame {collision_frame}, using frame {actual_frame}")
         
-        # Try multiple methods to read the frame
-        frame = None
+        # Extract the exact frame using sequential reading.
+        # Note: cv2.CAP_PROP_POS_FRAMES seek is unreliable for non-keyframes (H.264/H.265 codecs
+        # only allow accurate seeking to I-frames). Sequential reading is slower but guarantees
+        # we get the exact frame requested.
+        frame_img = None
+        ret = False
         
-        # Method 1: Direct frame seek
-        cap.set(cv2.CAP_PROP_POS_FRAMES, actual_frame)
-        ret, frame = cap.read()
-        
-        # Method 2: If failed, try time-based seek
-        if not ret or frame is None:
-            logger.info("Frame seek failed, trying time-based seek...")
-            target_ms = (actual_frame / video_fps) * 1000
-            cap.set(cv2.CAP_PROP_POS_MSEC, target_ms)
-            ret, frame = cap.read()
-        
-        # Method 3: If still failed, read frames sequentially
-        if not ret or frame is None:
-            logger.info("Time seek failed, reading frames sequentially...")
+        # For frames in the first ~100, sequential read is fast enough
+        # For later frames, try seek first then verify/correct
+        if actual_frame < 100:
+            logger.info(f"Using sequential read for frame {actual_frame} (small frame number)")
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             for i in range(actual_frame + 1):
-                ret, frame = cap.read()
+                ret, frame_img = cap.read()
                 if not ret:
+                    logger.warning(f"Sequential read failed at frame {i}")
                     break
+        else:
+            # Try to seek close to target, then read sequentially to exact frame
+            # Seek to ~50 frames before target (likely to hit a keyframe before our target)
+            seek_to = max(0, actual_frame - 50)
+            logger.info(f"Seeking to frame {seek_to}, then reading to {actual_frame}")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, seek_to)
+            
+            # Read frames until we reach our target
+            current_frame = seek_to
+            while current_frame <= actual_frame:
+                ret, frame_img = cap.read()
+                if not ret:
+                    logger.warning(f"Read failed at frame {current_frame}")
+                    break
+                current_frame += 1
+            
+            # If seek approach failed, fall back to full sequential read
+            if not ret or frame_img is None:
+                logger.info("Seek approach failed, falling back to full sequential read...")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                for i in range(actual_frame + 1):
+                    ret, frame_img = cap.read()
+                    if not ret:
+                        break
         
-        # Method 4: Just get any frame from the video
-        if not ret or frame is None:
-            logger.info("Sequential read failed, getting first available frame...")
+        # Last resort: just get any frame
+        if not ret or frame_img is None:
+            logger.info("All methods failed, getting first available frame...")
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
+            ret, frame_img = cap.read()
             actual_frame = 0
         
         cap.release()
@@ -783,7 +828,7 @@ async def get_collision_screenshot(
         import os
         os.unlink(temp_path)
         
-        if not ret or frame is None:
+        if not ret or frame_img is None:
             return CollisionScreenshotResponse(
                 success=False,
                 collision_frame=collision_frame,
@@ -794,23 +839,38 @@ async def get_collision_screenshot(
         logger.info(f"Successfully read frame {actual_frame}")
         
         # Draw bounding boxes on the frame for vehicles in collision
-        if analysis_result.collisions:
-            collision = analysis_result.collisions[0]
-            track_ids = [collision.track_id_1, collision.track_id_2]
+        if collision_to_annotate is not None:
+            track_ids = [collision_to_annotate.track_id_1, collision_to_annotate.track_id_2]
             
-            # Find detections at this frame for these tracks
+            logger.info(f"Looking for tracks {track_ids} at frame {actual_frame}")
+            
+            # Find detections at the ACTUAL frame we read (not requested frame)
             frame_detections = [
                 d for d in detections 
-                if d.frame_idx == collision_frame and d.track_id in track_ids
+                if d.frame_idx == actual_frame and d.track_id in track_ids
             ]
+            
+            logger.info(f"Found {len(frame_detections)} detections for collision tracks at frame {actual_frame}")
+            
+            # If no detections at actual_frame, try nearby frames
+            if not frame_detections:
+                for offset in range(-5, 6):
+                    test_frame = actual_frame + offset
+                    frame_detections = [
+                        d for d in detections 
+                        if d.frame_idx == test_frame and d.track_id in track_ids
+                    ]
+                    if frame_detections:
+                        logger.info(f"Found detections at nearby frame {test_frame}")
+                        break
             
             colors = [(0, 0, 255), (255, 0, 0)]  # Red and Blue
             for i, det in enumerate(frame_detections):
                 color = colors[i % len(colors)]
                 x, y, w, h = int(det.bbox_x), int(det.bbox_y), int(det.bbox_w), int(det.bbox_h)
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 3)
+                cv2.rectangle(frame_img, (x, y), (x + w, y + h), color, 3)
                 cv2.putText(
-                    frame, 
+                    frame_img, 
                     f"Track {det.track_id}", 
                     (x, y - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 
@@ -818,27 +878,30 @@ async def get_collision_screenshot(
                     color, 
                     2
                 )
+                logger.info(f"Drew box for Track {det.track_id} at ({x},{y},{w},{h})")
             
-            # Add collision label
+            # Add collision label with actual frame number
             cv2.putText(
-                frame,
-                f"COLLISION - Frame {collision_frame}",
+                frame_img,
+                f"COLLISION - Frame {actual_frame}",
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.2,
                 (0, 0, 255),
                 3
             )
+        else:
+            logger.warning("No collisions found in analysis result!")
         
         # Encode frame as PNG -> base64
-        _, buffer = cv2.imencode('.png', frame)
+        _, buffer = cv2.imencode('.png', frame_img)
         image_base64 = base64.b64encode(buffer).decode('utf-8')
         
-        logger.info(f"Successfully generated collision screenshot for frame {collision_frame}")
+        logger.info(f"Successfully generated collision screenshot for frame {actual_frame}")
         
         return CollisionScreenshotResponse(
             success=True,
-            collision_frame=collision_frame,
+            collision_frame=actual_frame,
             timestamp_seconds=timestamp_seconds,
             image_base64=image_base64
         )
